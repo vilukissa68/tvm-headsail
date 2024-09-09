@@ -22,5 +22,4 @@ import pathlib
 
 def gen_includes() -> str:
     includes = ""
-    includes += f'#include "dla_driver.h"'
     return includes

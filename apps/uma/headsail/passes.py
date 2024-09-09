@@ -55,12 +55,13 @@ class HeadsailConv2dPass:
             func: tvm.tir.PrimFunc, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
         ) -> tvm.tir.PrimFunc:
             def _replace_conv2d(op):
-                print("conv2d replaced")
                 if op == _entry_node:
                     irb = tvm.tir.ir_builder.create()
                     # Collection of buffer address
                     buffers = [b[1].data for b in _handles]
                     # extraction of loop offsets
+
+                    buffers = [b[1].data for b in _handles]
 
                     for k, v in _loops.items():
                         assert v.min.value == 0
@@ -82,9 +83,7 @@ class HeadsailConv2dPass:
                     stride = [1, 1]
                     clips = [0, 0]
 
-                    print(buffers)
                     args = buffers + input_offsets + kernel_offsets + bias_length + padding + stride + clips
-                    print(args)
                     irb.emit(tir_call(irb, True, cls._EXTERNAL_FUNCTION_NAME, *args))
                     irb_result = irb.get()
 
@@ -134,7 +133,6 @@ class HeadsailConv2dPass:
                     kh=rv_loops[5],
                     kw=rv_loops[6],
                 )
-                print(loops)
                 _entry_node = sch.get(rv_loops[1])
 
                 _loops = {k: sch.get(v) for k, v in loops.items()}
@@ -151,111 +149,6 @@ class HeadsailConv2dPass:
 
         r = _detect_and_replace_conv2d(func, mod, ctx)
         return r
-# @tvm.tir.transform.prim_func_pass(opt_level=2)
-# class HeadsailConv2dPass:
-#     _EXTERNAL_FUNCTION_NAME = "dla_conv2d"
-#     _TVM_BLOCK_MATCH_NAME = "compute_2"
-#     def transform_function(
-#         self, func: tvm.tir.PrimFunc, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-#     ) -> tvm.tir.PrimFunc:
-
-#         return self._headsail_conv2d_pass(func, mod, ctx)
-
-#     @classmethod
-#     def _headsail_conv2d_pass(cls, func, mod, ctx):
-#         _loops = dict()
-#         _handles = []
-#         _entry_node = None
-
-#         def _has_block(name: str, func: tvm.tir.PrimFunc) -> bool:
-#             """
-#             Determine of a tir.block with `name` exists in `func`
-#             """
-
-#             def _hb(op):
-#                 if isinstance(op, tvm.tir.Block):
-#                     _found_blocks.append(op.name_hint)
-
-#             _found_blocks = []
-#             tvm.tir.stmt_functor.post_order_visit(func.body, _hb)
-#             return name in _found_blocks
-
-#         def _detect_and_replace_conv2d(
-#             func: tvm.tir.PrimFunc,
-#             _mod: tvm.ir.IRModule,
-#             _ctx: tvm.ir.transform.PassContext,
-#         ) -> tvm.tir.PrimFunc:
-#             print("Detect called")
-#             def _replace_conv2d(op):
-#                 print("Conv2d replaced")
-#                 if op == _entry_node:
-#                     print(op)
-#                     irb = tvm.tir.ir_builder.create()
-#                     # Collection of buffer address
-#                     buffers = [b[1].data for b in _handles]
-
-#                     # extraction of loop offsets
-#                     for k, v in _loops.items():
-#                         assert v.min.value == 0
-#                     offset_order = ["ci", "w", "h", "co", "ci", "kh", "kw"]
-#                     offsets = [_loops[i].extent.value for i in offset_order]
-
-#                     # Input params
-#                     input_args = ["ci", "w", "h"]
-#                     input_offsets = [_loops[i].extent.value for i in input_args]
-#                     input_offsets = input_offsets + ["CHW"] # Input order
-
-#                     # Kernel params
-#                     kernel_args = ["co", "ci", "w", "h"]
-#                     kernel_offsets = [_loops[i].extent.value for i in kernel_args]
-#                     kernel_offsets = kernel_offsets + ["KCHW"] # Input order
-
-#                     # Padding
-#                     padding = [0, 0, 0, 0, 0]
-#                     stride = [1, 1]
-#                     clips = [0, 0]
-
-#                     print(buffers)
-#                     args = buffers + input_offsets + kernel_offsets + padding + stride + clips
-#                     print(args)
-#                     irb.emit(tir_call(irb, True, cls._EXTERNAL_FUNCTION_NAME, *args))
-#                     irb_result = irb.get()
-#                     return irb_result
-#                 elif isinstance(op, tvm.tir.SeqStmt):
-#                     # Remove that pad block of TOPI's conv2DNCHW by only returning the 2nd statement
-#                     return op.seq[1]
-#                 return op
-
-#             sch = tvm.tir.Schedule(func)
-
-#             print(func)
-
-#             if _has_block(cls._TVM_BLOCK_MATCH_NAME, func):
-#                 conv2d_block = sch.get_block(cls._TVM_BLOCK_MATCH_NAME)
-#                 rv_loops = sch.get_loops(conv2d_block)
-#                 assert len(rv_loops) == 7
-#                 loops = dict(
-#                     n=rv_loops[0],
-#                     co=rv_loops[1],
-#                     h=rv_loops[2],
-#                     w=rv_loops[3],
-#                     ci=rv_loops[4],
-#                     kh=rv_loops[5],
-#                     kw=rv_loops[6],
-#                 )
-#                 _entry_node = sch.get(rv_loops[1])
-#                 _loops = {k: sch.get(v) for k, v in loops.items()}
-#                 _handles = func.buffer_map.items()
-
-#                 x = tvm.tir.stmt_functor.ir_transform(
-#                     func.body, None, _replace_conv2d, ["tir.For", "tir.SeqStmt"]
-#                 )
-#                 return func.with_body(x)
-#             else:
-#                 return func
-
-#         r = _detect_and_replace_conv2d(func, mod, ctx)
-#         return r
 
 def tir_call(ib: tvm.tir.ir_builder, extern: bool, name: str, *args):
     """
@@ -300,6 +193,7 @@ class ConvertLayout:
         desired_layouts = {'qnn.conv2d': ['NCHW', 'default']}
         # Convert the layout to NCHW
         # RemoveUnunsedFunctions is used to clean up the graph.
+        print(mod)
         seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
                                     relay.transform.ConvertLayout(desired_layouts)])
         with tvm.transform.PassContext(opt_level=3):
@@ -313,7 +207,8 @@ class Canonicalize:
     def transform_module(self, mod, ctx):
 
         seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
-                                    relay.qnn.transform.CanonicalizeOps()])
+                                        relay.qnn.transform.CanonicalizeOps(),
+                                        relay.transform.AnnotateSpans()])
         with tvm.transform.PassContext(opt_level=3):
             mod = seq(mod)
 

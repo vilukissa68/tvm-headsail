@@ -134,6 +134,8 @@ def import_tf_model(path_to_model, shape_dict, input_type):
 #     return mod
 
 def export_annotated_library(mod, params, build_dir):
+
+    mod["main"] = relay.build_module.bind_params_by_name(mod["main"], params)
     print(tvm.target.Target.list_kinds())
     file_format_str = "{name}_c.{ext}"
     RUNTIME = tvm.relay.backend.Runtime("crt", {"system-lib" : False})
@@ -146,7 +148,7 @@ def export_annotated_library(mod, params, build_dir):
 
     headsail_target = tvm.target.Target(uma_backend.target_name, host=TARGET)
     target_c = tvm.target.Target("c")
-    EXECUTOR = tvm.relay.backend.Executor("aot", {"unpacked-api": True, "interface-api": "c", "link-params": True})
+    EXECUTOR = tvm.relay.backend.Executor("aot", {"unpacked-api": True, "interface-api": "c", "link-params": False})
 
     #mod = uma_backend.partition(mod, params)
     mod = uma_backend.partition(mod, params)
