@@ -1,0 +1,5 @@
+if(USE_BEAIVI)
+  message(STATUS "BUILT WITH BEAIVI SUPPORT!!!")
+  file(GLOB BEAIVI_CONTRIB_SRC src/relay/backend/contrib/beaivi/codegen.cc)
+  list(APPEND COMPILER_SRCS ${BEAIVI_CONTRIB_SRC})
+endif(USE_BEAIVI)
