@@ -101,40 +101,6 @@ class BeaiviCodegenCBase {
     indent_ -= 2;
   }
 
-  /*!
-   * \brief Creates a runtime function header
-   */
-  /*!
-   * \brief Gerenate C code for the external function.
-   *
-   * \param func_name The name of the external function.
-   * \param arg_types Types of arguments represented as string
-   *
-   * \code
-   *
-   * Array<NDArray> foo_consts;
-   *
-   * // An example code for the generated C function.
-   * int foo_wrapper_(DLTensor* arg0,
-   *                              DLTensor* arg1,
-   *                              DLTensor* out) {
-   *   foo_((float*)(arg0->data),
-   *        (float*)(arg1->data),
-   *        (float*)(out->data));
-   *   return 0;
-   * }
-   *
-   * TVM_DLL_EXPORT_TYPED_FUNC(foo, foo_wrapper_);
-   *
-   * int foo_init_wrapper_(Array<NDArray> arr) {
-   *   foo_consts = arr;
-   *   return 0;
-   * }
-   *
-   * TVM_DLL_EXPORT_TYPED_FUNC(__init_foo, foo_init_wrapper_);
-   *
-   * \endcode
-   */
   void GenerateBackendCFunc(const std::string& func_name, const std::vector<std::string>& arg_types,
                             const std::string& const_arr_name, const std::vector<Output>& outs,
                             bool pass_dl_tensor = false) {
@@ -186,12 +152,11 @@ class BeaiviCodegenCBase {
    *
    * \return The emitted code string.
    */
-  std::string JitImpl(
-      const std::string& ext_func_id, const Array<Var>& args,
-      const std::vector<std::string>& buf_decl, const std::vector<std::string>& body,
-      const std::string& const_arr_name,
-      const std::unordered_map<std::string, ExtractedConstArray>& extracted_constants,
-      const std::vector<Output>& outs) {
+  std::string JitImpl(const std::string& ext_func_id, const Array<Var>& args,
+                      const std::vector<std::string>& buf_decl,
+                      const std::vector<std::string>& body, const std::string& const_arr_name,
+                      const std::map<std::string, ExtractedConstArray>& extracted_constants,
+                      const int work_buffer_size, const std::vector<Output>& outs) {
     // Create a declaration for global ndarrays that contain constant data.
     code_stream_ << "//This was generated with beaivi codegen\n";
 
@@ -214,6 +179,9 @@ class BeaiviCodegenCBase {
       code_stream_ << GenerateConstantArray(x.first, x.second);
       std::cout << std::endl;
     }
+
+    // Adde work_buf
+    code_stream_ << "  int8_t work_buf[" << work_buffer_size << "] = {0}\n";
 
     this->EnterScope();
 
@@ -313,6 +281,10 @@ class BeaiviCodegenCBase {
   std::string CreateConstVar(const std::string& symbol, size_t const_id) const {
     // tvmgen_default_beaivi_const_0 etc...
     return symbol + "_const_" + std::to_string(const_id);
+  }
+  std::string CreateConstVar(const std::string& symbol, size_t const_id, std::string name) const {
+    // tvmgen_default_beaivi_const_0 etc...
+    return symbol + "__" + name + "_" + std::to_string(const_id);
   }
 
   /*! \brief The external function source code stream. */

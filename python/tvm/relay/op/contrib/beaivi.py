@@ -41,315 +41,186 @@ from tvm.relay.expr_functor import ExprVisitor
 from tvm.relay import transform
 from tvm.relay.analysis import free_vars
 from .register import register_pattern_table
-
-from ..strategy.generic import is_depthwise_conv2d
+from tvm.relay.op.contrib.register import get_pattern_table
 
 logger = logging.getLogger("BEAIVI")
 
+# %0 = nn.pad(%input_1, 83 /* ty=int32 span=functional_1/activation/Relu;functional_1/batch_normalization/FusedBatchNormV3;functional_1/conv2d/BiasAdd/ReadVariableOp/resource;functional_1/conv2d/BiasAdd;functional_1/conv2d_4/Conv2D;functional_1/conv2d/Conv2D1:0:0 */, pad_width=[[0, 0], [4, 5], [1, 1], [0, 0]]) /* ty=Tensor[(1, 58, 12, 1), int8] */;
+#   %1 = nn.conv2d(%0, meta[relay.Constant][0] /* ty=Tensor[(10, 4, 1, 64), int8] */, strides=[2, 2], padding=[0, 0, 0, 0], channels=64, kernel_size=[10, 4], data_layout="NHWC", kernel_layout="HWIO", out_dtype="int32") /* ty=Tensor[(1, 25, 5, 64), int32] */;
+#   %2 = subtract(%1, meta[relay.Constant][1] /* ty=Tensor[(1, 1, 1, 64), int32] */) /* ty=Tensor[(1, 25, 5, 64), int32] */;
+#   %3 = nn.bias_add(%2, meta[relay.Constant][2] /* ty=Tensor[(64), int32] */, axis=3) /* ty=Tensor[(1, 25, 5, 64), int32] span=functional_1/activation/Relu;functional_1/batch_normalization/FusedBatchNormV3;functional_1/conv2d/BiasAdd/ReadVariableOp/resource;functional_1/conv2d/BiasAdd;functional_1/conv2d_4/Conv2D;functional_1/conv2d/Conv2D1:0:0 */;
+#   %4 = fixed_point_multiply_per_axis(%3, meta[relay.Constant][3] /* ty=Tensor[(64), int32] */, meta[relay.Constant][4] /* ty=Tensor[(64), int32] */, meta[relay.Constant][5] /* ty=Tensor[(64), int32] */, is_rshift_required=True, axes=[3]) /* ty=Tensor[(1, 25, 5, 64), int32] */;
+#   %5 = add(-128 /* ty=int32 span=functional_1/activation/Relu;functional_1/batch_normalization/FusedBatchNormV3;functional_1/conv2d/BiasAdd/ReadVariableOp/resource;functional_1/conv2d/BiasAdd;functional_1/conv2d_4/Conv2D;functional_1/conv2d/Conv2D1:0:0 */, %4) /* ty=Tensor[(1, 25, 5, 64), int32] */;
+#   %6 = clip(%5, a_min=-128f, a_max=127f) /* ty=Tensor[(1, 25, 5, 64), int32] */;
+#   %7 = cast(%6, dtype="int8") /* ty=Tensor[(1, 25, 5, 64), int8] */;
 
-def qnn_tflite_conv2d_bias():
-    data = wildcard()
-    weight = wildcard()
+
+def conv2d_pattern(with_pad):
+    pattern_input = wildcard()
+    weights = wildcard()
     bias = wildcard()
-    pattern = is_op("qnn.conv2d")(
-        data, weight, is_constant(), is_constant(), is_constant(), is_constant()
+    if with_pad:
+        pattern = is_op("nn.pad")(pattern_input, is_constant())
+        pattern = is_op("nn.conv2d")(pattern, weights)
+    else:
+        pattern = is_op("nn.conv2d")(pattern_input, weights)
+    pattern = is_op("subtract")(pattern, is_constant())
+    pattern = is_op("nn.bias_add")(pattern, bias)
+    # Scale factor, shift, zero_point
+    pattern = is_op("fixed_point_multiply_per_axis")(
+        pattern, is_constant(), is_constant(), is_constant()
     )
-    # pattern = is_op("qnn.conv2d")(data, weight, wildcard(), wildcard(), wildcard(), wildcard())
-    pattern = is_op("add")(pattern, bias)
-    # pattern = is_op("qnn.requantize")(
-    # pattern, is_constant(), is_constant(), is_constant(), is_constant()
-    # )
-    pattern = is_op("qnn.requantize")(pattern, wildcard(), wildcard(), wildcard(), wildcard())
 
+    pattern = is_op("add")(pattern, is_constant())
     pattern = is_op("clip")(pattern)
+    pattern = is_op("cast")(pattern)
     return pattern
 
 
-def check_is_grouped(pattern):
-    if str(pattern.op.name) == "clip":
-        relu = pattern
-        req = relu.args[0]
-        bias = req.args[0]
-        conv = bias.args[0]
-    elif str(pattern.op.name) == "qnn.requantize":
-        req = pattern
-        bias = req.args[0]
-        conv = bias.args[0]
-    elif str(pattern.op.name) == "nn.bias_add":
-        bias = pattern
-        conv = bias.args[0]
-    elif str(pattern.op.name) == "qnn.conv2d":
-        conv = pattern
-    else:
-        conv = None
-        raise Exception(f"Unknown pattern name {str(pattern.op.name)}")
-    groups = conv.attrs.groups
-    if groups > 1:
-        return True
-    return False
+def pattern_name(pattern):
+    return str(pattern.op.name)
 
 
-def check_is_not_grouped(pattern):
-    print(pattern.op.name)
-    if str(pattern.op.name) == "clip":
-        relu = pattern
-        req = relu.args[0]
-        bias = req.args[0]
-        conv = bias.args[0]
-    elif str(pattern.op.name) == "qnn.requantize":
-        req = pattern
-        bias = req.args[0]
-        conv = bias.args[0]
-    elif str(pattern.op.name) == "nn.bias_add":
-        bias = pattern
-        conv = bias.args[0]
-    elif str(pattern.op.name) == "qnn.conv2d":
+def check_is_depthwise(pattern):
+    print("Depthwise")
+    # Find conv
+    conv = None
+    if pattern_name(pattern) == "cast":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "clip":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "add":
+        pattern = pattern.args[1]
+    if pattern_name(pattern) == "fixed_point_multiply_per_axis":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "nn.bias_add":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "subtract":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "nn.conv2d":
         conv = pattern
-    else:
-        conv = None
+    if not conv:
         raise Exception(f"Unknown pattern name {str(pattern.op.name)}")
-    groups = conv.attrs.groups
-    if groups > 1:
-        return False
-    return True
+    return conv.attrs.groups > 1
+
+
+def check_is_not_depthwise(pattern):
+    print("Not Depthwise")
+    conv = None
+    if pattern_name(pattern) == "cast":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "clip":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "add":
+        pattern = pattern.args[1]
+    if pattern_name(pattern) == "fixed_point_multiply_per_axis":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "nn.bias_add":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "subtract":
+        pattern = pattern.args[0]
+    if pattern_name(pattern) == "nn.conv2d":
+        conv = pattern
+    if not conv:
+        raise Exception(f"Unknown pattern name {str(pattern.op.name)}")
+    return conv.attrs.groups == 1
 
 
 @register_pattern_table("beaivi")
 def pattern_table():
-    tflite_conv2d_bias = (
+    print("Patterns")
+    conv2d = (
         "beaivi.conv2d",
-        qnn_tflite_conv2d_bias(),
-        check_is_not_grouped,
+        conv2d_pattern(False),
+        check_is_not_depthwise,
     )
-    tflite_conv2d_bias_depthwise = (
+    conv2d_padded = (
+        "beaivi.conv2d",
+        conv2d_pattern(True),
+        check_is_not_depthwise,
+    )
+    conv2d_depthwise = (
         "beaivi.conv2d_depthwise",
-        qnn_tflite_conv2d_bias(),
-        check_is_grouped,
+        conv2d_pattern(False),
+        check_is_depthwise,
     )
-    return [tflite_conv2d_bias, tflite_conv2d_bias_depthwise]
-
-
-class NextOpChecker(ExprVisitor):
-    def __init__(self, target_op_name, max_depth=100):
-        super().__init__()
-        self.target_op_name = target_op_name
-        self.found_target_op = False
-        self.index = 0
-        self.max_depth = max_depth
-
-    def visit_call(self, call):
-        print("VISITING:", self.index, "|", call.op.name)
-        self.index = self.index + 1
-
-        if call.op.name == self.target_op_name:
-            self.found_target_op = True
-        if self.index <= self.max_depth:
-            super().visit_call(call)
-
-    def check_next_op(self, expr):
-        self.found_target_op = False
-        self.visit(expr)
-        return self.found_target_op
+    conv2d_depthwise_padded = (
+        "beaivi.conv2d_depthwise",
+        conv2d_pattern(True),
+        check_is_depthwise,
+    )
+    # NOTE: Order is import here, since patterns are checked for in order 0->N.
+    # Padded are less inclusive so those need to be checked first
+    return [conv2d_padded, conv2d, conv2d_depthwise_padded, conv2d_depthwise]
 
 
 class LegalizeQnnOpForBeaivi(DFPatternCallback):
-    """Legalize QNN based patterns to match DNNL
-
-    original pattern:
-      OP = qnn.conv2d
-      %1 = OP<int>(SRC, WGH) - OP<int>(src_zp, WGH)   // qnn.conv2d
-      %2 = %1 + orig_bias                             // bias
-      %2 = (%1 - rq_in_zp) * rq_in_scl / rq_out_scl + rq_out_zp  // qnn.requantize
-      %3 = act(%2)                                               // activation == clip
-
-    transform to Beaivi compatible:
-      %1 = OP<int>(SRC, WGH)
-      %2 = (%1 + bias)
-      %3 = cast(%2, dtype="float")
-      %4 = act(%4) * act_scl
-      %5 = %4 + SRC2 * sum_scl
-      %6 = cast(%5, dtype="int8")
-
-    where:
-      act_scl = sum_lhs_scl / sum_out_scl
-      sum_scl = sum_rhs_scl / sum_out_scl
-    """
-
     def __init__(self):
         super(LegalizeQnnOpForBeaivi, self).__init__()
-        self.src = wildcard()
+
+        # Define common wildcards
+        self.pattern_input = wildcard()
         self.wgh = wildcard()
         self.bias = wildcard()
-        self.sum_src = is_constant()
 
-        # self.src_scl = is_constant()
-        # self.src_zp = is_constant()
-        # self.wgh_scl = is_constant()
-        # self.wgh_zp = is_constant()
+        # Define pad operation (if it exists)
+        self.pad = is_op("nn.pad")(self.pattern_input)
 
-        # self.rq_in_scl = is_constant()
-        # self.rq_in_zp = is_constant()
-        # self.rq_out_scl = is_constant()
-        # self.rq_out_zp = is_constant()
+        # Define conv2d operation, which can take either the original src or a padded src
+        self.conv = is_op("nn.conv2d")((self.pad | self.pattern_input), self.wgh)
 
-        self.src_scl = wildcard()
-        self.src_zp = wildcard()
-        self.wgh_scl = wildcard()
-        self.wgh_zp = wildcard()
-
-        self.rq_in_scl = wildcard()
-        self.rq_in_zp = wildcard()
-        self.rq_out_scl = wildcard()
-        self.rq_out_zp = wildcard()
-
-        self.sum_lhs_scl = is_constant()
-        self.sum_lhs_zp = is_constant()
-        self.sum_rhs_scl = is_constant()
-        self.sum_rhs_zp = is_constant()
-        self.sum_out_scl = is_constant()
-        self.sum_out_zp = is_constant()
-
-        self.root = (is_op("qnn.conv2d") | is_op("qnn.dense"))(
-            self.src, self.wgh, self.src_zp, self.wgh_zp, self.src_scl, self.wgh_scl
+        # Rest of the pattern
+        self.sub = is_op("subtract")(self.conv, is_constant())
+        self.bias_add = is_op("nn.bias_add")(self.sub, self.bias)
+        self.fixed_point = is_op("fixed_point_multiply_per_axis")(
+            self.bias_add, is_constant(), is_constant(), is_constant()
         )
-        pat = is_op("nn.bias_add")(self.root, self.bias) | self.root  # optional bias
-        pat = is_op("qnn.requantize")(
-            pat, self.rq_in_scl, self.rq_in_zp, self.rq_out_scl, self.rq_out_zp
-        )
+        self.add = is_op("add")(self.fixed_point, is_constant())
+        self.clip = is_op("clip")(self.add)
+        self.cast = is_op("cast")(self.clip)
 
-        # TFlite manual clip
-        self.manual_clip = is_op("minimum")(pat, wildcard())
-        self.manual_clip = is_op("maximum")(self.manual_clip, wildcard())
-        pat = pat | self.manual_clip
-
-        self.clip = is_op("clip")(pat)
-        pat = pat | self.clip
-
-        add = is_op("qnn.add")(
-            pat,
-            self.sum_src,
-            self.sum_lhs_scl,
-            self.sum_lhs_zp,
-            self.sum_rhs_scl,
-            self.sum_rhs_zp,
-            self.sum_out_scl,
-            self.sum_out_zp,
-        )
-        add = is_op("clip")(add)
-        self.pattern = pat | add
-
-        # pat = pat | add
-        # self.out_of_dla_cast = is_op("cast")(pat)
-        # self.pattern = pat | self.out_of_dla_cast
+        # Full pattern
+        self.pattern = self.cast
 
     def callback(self, pre, post, node_map):
         root = node_map[self.root][0]
-        src = node_map[self.src][0]
-        wgh = node_map[self.wgh][0]
-        bias = node_map.get(self.bias, default=[relay.const(0, dtype="int32")])[0]
-        src_scl = node_map[self.src_scl][0]
-        src_zp = node_map[self.src_zp][0]
-        rq_in_scl = node_map[self.rq_in_scl][0]
-        rq_in_zp = node_map[self.rq_in_zp][0]
-        rq_out_scl = node_map[self.rq_out_scl][0]
-        rq_out_zp = node_map[self.rq_out_zp][0]
-        final_dtype = "int8"
+        output = relay.Call(conv2d_node.op, conv2d_node.args, attrs=new_attrs)
 
-        def cast_fp(op):
-            return relay.op.cast(op, dtype="float32")
-
-        def cast_int8(op):
-            return relay.op.cast(op, dtype="int8")
-
-        # Default values if qnn.sum is not present
-        # sum_src = node_map[self.sum_src][0] if self.sum_src in node_map else None
-        # sum_lhs_scl = node_map[self.sum_lhs_scl][0] if sum_src else relay.const(1, dtype="float32")
-        # sum_lhs_zp = (
-        #     node_map[self.sum_lhs_zp][0] if sum_src else relay.const(3735928559, dtype="int32")
-        # )
-        # sum_rhs_scl = node_map[self.sum_rhs_scl][0] if sum_src else relay.const(0, dtype="float32")
-        # sum_rhs_zp = node_map[self.sum_rhs_zp][0] if sum_src else relay.const(0, dtype="int32")
-        # sum_out_scl = node_map[self.sum_out_scl][0] if sum_src else relay.const(1, dtype="float32")
-        # sum_out_zp = node_map[self.sum_out_zp][0] if sum_src else relay.const(0, dtype="int32")
-
-        # Compute scaling factors for requantization
-        # zero_zp = relay.const(0, dtype="int32")
-        # act_scl = sum_lhs_scl / sum_out_scl
-        # sum_scl = sum_rhs_scl / sum_out_scl
-
-        # next_op_checker = NextOpChecker("nn.avg_pool2d", 6)
-
-        # Check if any user of `final_node` is a `qnn.conv2d`
-        # if next_op_checker.check_next_op(pre):
-
-        # if self.out_of_dla_cast in node_map:
-        #
-        print("src_scl:", src_scl)
-        print("src_zp:", src_zp)
-        print("rq_in_scl:", rq_in_scl)
-        print("rq_out_scl:", rq_out_scl)
-        print("rq_in_zp:", rq_in_zp)
-        print("rq_out_zp:", rq_out_zp)
-
-        # if False:
-        #     rq_in_zp = zero_zp
-        #     rq_out_zp = rq_out_zp
-        # else:
-        #     rq_in_zp = zero_zp
-        #     rq_out_zp = zero_zp
-
-        zero_zp = relay.const(0, dtype="int32")
-        one_zp = relay.const(1, dtype="int32")
-        # Construct the new computation graph
-        output = tvm.relay.Call(
-            root.op,
-            [
-                src,
-                wgh,
-                zero_zp,
-                one_zp,
-                relay.const(69.0, dtype="float32"),
-                relay.const(45.0, dtype="float32"),
-            ],
-            root.attrs,
-            root.type_args,
-            root.span,
-        )
-        output = output + bias
-
-        # Insert requantize node back
-        output = relay.qnn.op.requantize(
-            output,
-            input_scale=rq_in_scl,
-            input_zero_point=rq_in_zp,
-            output_scale=rq_out_scl,
-            output_zero_point=rq_out_zp,
-            out_dtype="int8",
-        )
-
-        # Apply clipping with optional ReLU
-        if self.clip in node_map:
-            output = relay.op.clip(output, 0, 127)
-
-        print("Legalization pass done")
         return output
 
 
 def legalize_qnn_for_beaivi(mod):
     print("Legalizing qnn for Beaivi")
 
-    mod["main"] = rewrite(LegalizeQnnOpForBeaivi(), mod["main"])
-
     desired_layouts = {"qnn.conv2d": ["NHWC", "OHWI"]}
-    seq = tvm.transform.Sequential(
+
+    beaivi_patterns = get_pattern_table("beaivi")
+
+    # Pre process
+    preprocessor_pass = tvm.transform.Sequential(
         [
-            transform.InferType(),
-            transform.ConvertLayout(desired_layouts),
-            # transform.SimplifyInference(),  # TODO: this pass decompose nn.layer_norm
-            # transform.FoldScaleAxis(),  # TODO: fail inside TVM in case of grouped convolutions.
+            relay.qnn.transform.Legalize(),
+            relay.qnn.transform.CanonicalizeOps(),
+            relay.transform.InferType(),
+            # relay.transform.ConvertLayout(desired_layouts),
+            relay.transform.SimplifyExpr(),
             transform.FoldConstant(),
         ]
     )
+
+    annotation_pass = tvm.transform.Sequential(
+        [
+            relay.transform.MergeComposite(beaivi_patterns),
+            relay.transform.AnnotateTarget(["beaivi"]),
+            relay.transform.MergeCompilerRegions(),
+            relay.transform.PartitionGraph(),
+            relay.transform.FoldConstant(),
+        ]
+    )
+
     with tvm.transform.PassContext(opt_level=3):
-        mod = seq(mod)
+        mod = preprocessor_pass(mod)
+        print(mod)
+        # mod["main"] = rewrite(LegalizeQnnOpForBeaivi(), mod["main"])
+        mod = annotation_pass(mod)
     return mod
