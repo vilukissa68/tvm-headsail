@@ -50,13 +50,16 @@ using namespace backend;
 
 // Struct to hold all arguments that are to be passed to the function call to the layer
 struct Callables {
-  std::vector<std::string> input_args;  // Comes from previous node
-  std::vector<std::string> conv2d_args;
+  std::vector<std::string> input;  // Comes from previous node
   std::vector<std::string> conv2d_attrs;
-  std::vector<std::string> bias_args;
-  std::vector<std::string> bias_attrs;
-  std::vector<std::string> requantize_args;
-  std::vector<std::string> requantize_attrs;
+  std::vector<std::string> bias;
+  std::vector<std::string> weights;
+  std::vector<std::string> scales;
+  std::vector<std::string> shifts;
+  std::vector<std::string> zp_subtract;
+  std::vector<std::string> zp;
+  std::vector<std::string> input_sub_attr;
+  std::vector<std::string> padding;
 };
 
 inline size_t GetShape1DSize(const Type& type) {
@@ -77,11 +80,24 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
   Callables Conv2d_bias(const FunctionNode* callee, const CallNode* caller, bool depthwise) {
     Callables callables;
     const Conv2DAttrs* conv2d_attr = nullptr;
+    const PadAttrs* padding_attrs = nullptr;
+    const CallNode* conv2d_node = nullptr;
+
+    // Increment total calls in module
+    ++funcs_in_mod_;
+
+    // Initalize padding
+    int pad_top = 0;
+    int pad_right = 0;
+    int pad_left = 0;
+    int pad_bottom = 0;
+
+    // Initialize zero-point
+    int zp = 0;
 
     // Extract function inputs from previous node
-    callables.input_args.push_back(VisitExpr(caller->args[0])[0].name);  // Get inputs
-    callables.input_args.push_back(ExtractConstant(caller->args[1].as<ConstantNode>(), "weight"));
-    callables.input_args.push_back(ExtractConstant(caller->args[2].as<ConstantNode>(), "bias"));
+    callables.input.push_back(VisitExpr(caller->args[0])[0].name);  // Get inputs
+    // callables.input_args.push_back(ExtractConstant(caller->args[2].as<ConstantNode>(), "bias"));
 
     const auto* current_call = callee->body.as<CallNode>();
 
@@ -92,56 +108,93 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
       current_call = current_call->args[0].as<CallNode>();
     }
     if (backend::IsOp(current_call, "add")) {
+      const int* zp_ptr =
+          static_cast<const int*>((current_call->args[0].as<ConstantNode>()->data)->data);
+      zp = zp_ptr[0];
+      callables.zp_subtract.push_back(std::to_string(zp));
       current_call = current_call->args[1].as<CallNode>();
     }
 
     if (backend::IsOp(current_call, "fixed_point_multiply_per_axis")) {
       // callables.requantize_args = GetArgumentNames(current_call);
       std::string scale = ExtractConstant(current_call->args[1].as<ConstantNode>(), "scale");
-      std::string zp = ExtractConstant(current_call->args[2].as<ConstantNode>(), "zero_point");
+      // std::string zp = ExtractConstant(current_call->args[2].as<ConstantNode>(), "zp");
       std::string shift = ExtractConstant(current_call->args[3].as<ConstantNode>(), "shift");
-      callables.requantize_args.push_back(scale);
-      callables.requantize_args.push_back(shift);
-      callables.requantize_args.push_back(zp);
+      callables.scales.push_back(scale);
+      callables.shifts.push_back(shift);
+      // callables.zp.push_back(zp);
       current_call = current_call->args[0].as<CallNode>();
     }
 
     if (backend::IsOp(current_call, "nn.bias_add")) {
+      callables.bias.push_back(ExtractConstant(current_call->args[1].as<ConstantNode>(), "bias"));
       current_call = current_call->args[0].as<CallNode>();
     }
 
     if (backend::IsOp(current_call, "subtract")) {
       current_call = current_call->args[0].as<CallNode>();
     }
+
     if (backend::IsOp(current_call, "nn.conv2d")) {
+      callables.weights.push_back(
+          ExtractConstant(current_call->args[1].as<ConstantNode>(), "weight"));
+
       conv2d_attr = current_call->attrs.as<Conv2DAttrs>();
       ICHECK(conv2d_attr);
+
+      // Save conv node for padding resolution
+      conv2d_node = current_call;
+      if (current_call->args[0].as<CallNode>()) {
+        current_call = current_call->args[0].as<CallNode>();
+      } else {
+        callables.input_sub_attr.push_back(std::to_string(zp));
+      }
     }
 
-    auto ishape = GetShape(current_call->args[0]->checked_type());  // Input shape
-    auto wshape = GetShape(current_call->args[1]->checked_type());  // Kernel shape
+    if (backend::IsOp(current_call, "nn.pad")) {
+      padding_attrs = current_call->attrs.as<PadAttrs>();
+      pad_top = padding_attrs->pad_width[1][0].IntValue();
+      pad_right = padding_attrs->pad_width[2][1].IntValue();
+      pad_left = padding_attrs->pad_width[2][0].IntValue();
+      pad_bottom = padding_attrs->pad_width[1][1].IntValue();
+      std::cout << "Pad top " << pad_top << std::endl;
+      std::cout << "Pad right " << pad_right << std::endl;
+      std::cout << "Pad left " << pad_left << std::endl;
+      std::cout << "Pad bottom " << pad_bottom << std::endl;
 
-    // TODO Check these are correct
+      const int* input_sub_value =
+          static_cast<const int*>((current_call->args[1].as<ConstantNode>()->data)->data);
+      // NOTE:(20250226 vaino-waltteri.granat@tuni.fi) When using TFLite quantized models we need to
+      // corret zp by -128. This information can't be parsed from nn.pad so it's added here.
+      callables.input_sub_attr.push_back(std::to_string(input_sub_value[0]));
+    }
+
+    auto ishape = GetShape(conv2d_node->args[0]->checked_type());  // Input shape
+    auto wshape = GetShape(conv2d_node->args[1]->checked_type());  // Kernel shape
+
     int input_channels = ishape[3];
-    int input_height = ishape[1];
-    int input_width = ishape[2];
+    int input_height = ishape[1] - pad_bottom - pad_top;
+    int input_width = ishape[2] - pad_right - pad_left;
 
-    callables.conv2d_attrs.push_back(std::to_string(input_channels));  // Input channels
     callables.conv2d_attrs.push_back(std::to_string(input_height));    // Input height
     callables.conv2d_attrs.push_back(std::to_string(input_width));     // Input width
-    callables.conv2d_attrs.push_back(std::to_string(wshape[0]));       // Kernels amount
-    callables.conv2d_attrs.push_back(std::to_string(wshape[2]));       // Kernels height
-    callables.conv2d_attrs.push_back(std::to_string(wshape[3]));       // Kernels width
+    callables.conv2d_attrs.push_back(std::to_string(input_channels));  // Input channels
+
+    // NOTE: There is a discrepency with TFLite and TVM. TVM considers the kernel layout
+    // to be OIHW, but looking at the weights they are HWIO
+    callables.conv2d_attrs.push_back(std::to_string(wshape[0]));  // Kernels height
+    callables.conv2d_attrs.push_back(std::to_string(wshape[1]));  // Kernels width
+    callables.conv2d_attrs.push_back(std::to_string(wshape[3]));  // Kernels amount
 
     // Padding
-    int pad_top = conv2d_attr->padding[0].as<IntImmNode>()->value;
-    int pad_right = conv2d_attr->padding[3].as<IntImmNode>()->value;
-    int pad_left = conv2d_attr->padding[1].as<IntImmNode>()->value;
-    int pad_bottom = conv2d_attr->padding[2].as<IntImmNode>()->value;
+    // int pad_top = conv2d_attr->padding[0].as<IntImmNode>()->value;
+    // int pad_right = conv2d_attr->padding[3].as<IntImmNode>()->value;
+    // int pad_left = conv2d_attr->padding[1].as<IntImmNode>()->value;
+    // int pad_bottom = conv2d_attr->padding[2].as<IntImmNode>()->value;
     callables.conv2d_attrs.push_back(std::to_string(pad_top));     // Pad top
-    callables.conv2d_attrs.push_back(std::to_string(pad_right));   // Pad right
-    callables.conv2d_attrs.push_back(std::to_string(pad_left));    // Pad left
     callables.conv2d_attrs.push_back(std::to_string(pad_bottom));  // Pad bottom
+    callables.conv2d_attrs.push_back(std::to_string(pad_left));    // Pad left
+    callables.conv2d_attrs.push_back(std::to_string(pad_right));   // Pad right
 
     // Required work_buffer_size
     int required_work_buffer = (pad_top + input_height + pad_bottom) *
@@ -153,6 +206,16 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     callables.conv2d_attrs.push_back(
         std::to_string(conv2d_attr->strides[1].as<IntImmNode>()->value));  // Stride y
 
+    // We are in the end of the pattern, extract input subtraction
+    return callables;
+  }
+
+  Callables Avg_pool2d(const FunctionNode* callee, const CallNode* caller, bool depthwise) {
+    Callables callables;
+    const Conv2DAttrs* conv2d_attr = nullptr;
+    const PadAttrs* padding_attrs = nullptr;
+    const CallNode* conv2d_node = nullptr;
+    std::cout << "Here" << std::endl;
     return callables;
   }
 
@@ -245,7 +308,6 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
       num_elements *= data->shape[i];
     }
 
-    // Extract constant values
     // Convert the constant values to string and push to vector
     if (data->dtype.code == kDLFloat && data->dtype.bits == 32) {
       const float* values = static_cast<const float*>(data->data);
@@ -281,6 +343,7 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     if (const auto* func = call->op.as<FunctionNode>()) {
       ret = GenerateCompositeFunctionCall(func, call);
     }
+
     ext_func_body_.push_back(ret.decl);
     return ret.outputs;
   }
@@ -328,13 +391,15 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     ICHECK(pattern_name.defined()) << "Only functions with composite attribute supported";
 
     if (pattern_name == "beaivi.conv2d") {
-      std::cout << "Non Depthwise Pattern found in BYOC!!!!" << std::endl;
-
       Callables arguments = Conv2d_bias(callee, caller, false);
       return GenerateBody(caller, "beaivi_conv2d_int8_nhwc", arguments);
     } else if (pattern_name == "beaivi.conv2d_depthwise") {
       Callables arguments = Conv2d_bias(callee, caller, true);
-      return GenerateBody(caller, "beaivi_conv2d_grouped_int8_nhwc", arguments);
+      return GenerateBody(caller, "beaivi_conv2d_depthwise_int8_nhwc", arguments);
+    } else if (pattern_name == "beaivi.avg_pool2d") {
+      std::cout << "HEREEE" << std::endl;
+      Callables arguments = Conv2d_bias(callee, caller, true);
+      return GenerateBody(caller, "beaivi_avgpool2d_int8_nhwc", arguments);
     }
 
     LOG(FATAL) << "Unknown composite function:" << pattern_name;
@@ -347,11 +412,7 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     std::ostringstream decl_stream;
 
     // Wildcard arguments i.e. input, weight, output
-    decl_stream << "(" << args.input_args[0];
-    for (size_t i = 1; i < args.input_args.size(); ++i) {
-      decl_stream << ", " << args.input_args[i];
-    }
-
+    decl_stream << "(" << args.input[0];
     std::cout << "Input arguments handled" << std::endl;
 
     // Analyze the output buffers
@@ -377,32 +438,42 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     GenerateBodyOutput ret;
     for (const auto& out_type : out_types) {
       this->PrintIndents();
-      const std::string out = "buf_" + std::to_string(buf_idx_++);
+      std::string out;
+      // Attach to module output buffer
+      if (++buf_idx_ == funcs_in_mod_) {
+        out = "out0";
+      } else {
+        out = "io_buf";
+      }
       const auto out_size = GetShape1DSize(out_type) * sizeof(int32_t);
-      decl_stream << ", " << out;
+      decl_stream << ", " << out << ", " << "padding_buf";
 
       Output output;
       output.name = out;
       output.size = out_size;
       output.dtype = GetDtypeString(out_type.as<TensorTypeNode>());
-      output.need_copy = true;
+      output.need_copy = false;
       ret.buffers.push_back("int* " + out + " = (int*)malloc(" + std::to_string(out_size) + ");");
       ret.outputs.push_back(output);
     }
 
-    // Conv2d Attrs
-    // for (size_t i = 0; i < args.conv2d_attrs.size(); ++i) {
-    //   decl_stream << ", " << args.conv2d_attrs[i];
-    // }
+    decl_stream << ", " << args.weights[0];
+    decl_stream << ", " << args.bias[0];
 
-    // Print workbuffer
-    decl_stream << ", " << "work_buf*";
+    // Input subtraction
+    std::cout << "Input sub: " << args.input_sub_attr[0] << std::endl;
+    decl_stream << ", " << args.input_sub_attr[0];
+
+    // Conv2d Attrs
+    for (size_t i = 0; i < args.conv2d_attrs.size(); ++i) {
+      decl_stream << ", " << args.conv2d_attrs[i];
+    }
 
     // // Requantize attrs
-    decl_stream << ", " << args.requantize_args[0];  // Scaling factor
-    decl_stream << ", " << args.requantize_args[1];  // Shift
-    decl_stream << ", " << args.requantize_args[2];  // Zero point
-    // }
+    decl_stream << ", " << args.scales[0];       // Scaling factor
+    decl_stream << ", " << args.shifts[0];       // Shift
+    decl_stream << ", " << args.zp_subtract[0];  // Input Zero point
+    // decl_stream << ", " << args.zp[0];           // Input Zero point
     decl_stream << ");";
     ret.decl = func_name + decl_stream.str();
     return ret;
@@ -435,6 +506,7 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
   std::vector<int> work_buffers_;
   /*! \brief The variable name to constant mapping. */
   Array<String>* const_names_;
+  int funcs_in_mod_{0};
 
   friend class BeaiviModuleCodegen;
 };
@@ -476,6 +548,8 @@ class BeaiviModuleCodegen : public CSourceModuleCodegenBase {
     // Create headers
     code_stream_ << "#include <stdint.h>\n";
     code_stream_ << "#include <dsp_conv2d.h>\n";
+    code_stream_ << "#include <dsp_conv2d_depthwise.h>\n";
+    code_stream_ << "#include <dsp_avgpool2d.h>\n";
     code_stream_ << "\n";
 
     ICHECK(ref->IsInstance<FunctionNode>());

@@ -181,7 +181,8 @@ class BeaiviCodegenCBase {
     }
 
     // Adde work_buf
-    code_stream_ << "  int8_t work_buf[" << work_buffer_size << "] = {0}\n";
+    code_stream_ << "  int8_t io_buf[" << work_buffer_size << "] = {0};\n";
+    code_stream_ << "  int8_t padding_buf[" << work_buffer_size << "] = {0};\n";
 
     this->EnterScope();
 

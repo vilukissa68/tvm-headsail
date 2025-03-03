@@ -37,28 +37,24 @@ import tvm.ir
 from tvm import relay
 from ...dataflow_pattern import DFPatternCallback, is_constant, is_expr, is_op, rewrite, wildcard
 from tvm.relay.expr import Call, GlobalVar, TupleGetItem, const
-from tvm.relay.expr_functor import ExprVisitor
+from tvm.relay.expr_functor import ExprVisitor, ExprMutator
 from tvm.relay import transform
 from tvm.relay.analysis import free_vars
 from .register import register_pattern_table
 from tvm.relay.op.contrib.register import get_pattern_table
+from ..strategy.generic import is_depthwise_conv2d
+from tvm.relay.qnn.op import requantize
+
+import numpy as np
+
 
 logger = logging.getLogger("BEAIVI")
-
-# %0 = nn.pad(%input_1, 83 /* ty=int32 span=functional_1/activation/Relu;functional_1/batch_normalization/FusedBatchNormV3;functional_1/conv2d/BiasAdd/ReadVariableOp/resource;functional_1/conv2d/BiasAdd;functional_1/conv2d_4/Conv2D;functional_1/conv2d/Conv2D1:0:0 */, pad_width=[[0, 0], [4, 5], [1, 1], [0, 0]]) /* ty=Tensor[(1, 58, 12, 1), int8] */;
-#   %1 = nn.conv2d(%0, meta[relay.Constant][0] /* ty=Tensor[(10, 4, 1, 64), int8] */, strides=[2, 2], padding=[0, 0, 0, 0], channels=64, kernel_size=[10, 4], data_layout="NHWC", kernel_layout="HWIO", out_dtype="int32") /* ty=Tensor[(1, 25, 5, 64), int32] */;
-#   %2 = subtract(%1, meta[relay.Constant][1] /* ty=Tensor[(1, 1, 1, 64), int32] */) /* ty=Tensor[(1, 25, 5, 64), int32] */;
-#   %3 = nn.bias_add(%2, meta[relay.Constant][2] /* ty=Tensor[(64), int32] */, axis=3) /* ty=Tensor[(1, 25, 5, 64), int32] span=functional_1/activation/Relu;functional_1/batch_normalization/FusedBatchNormV3;functional_1/conv2d/BiasAdd/ReadVariableOp/resource;functional_1/conv2d/BiasAdd;functional_1/conv2d_4/Conv2D;functional_1/conv2d/Conv2D1:0:0 */;
-#   %4 = fixed_point_multiply_per_axis(%3, meta[relay.Constant][3] /* ty=Tensor[(64), int32] */, meta[relay.Constant][4] /* ty=Tensor[(64), int32] */, meta[relay.Constant][5] /* ty=Tensor[(64), int32] */, is_rshift_required=True, axes=[3]) /* ty=Tensor[(1, 25, 5, 64), int32] */;
-#   %5 = add(-128 /* ty=int32 span=functional_1/activation/Relu;functional_1/batch_normalization/FusedBatchNormV3;functional_1/conv2d/BiasAdd/ReadVariableOp/resource;functional_1/conv2d/BiasAdd;functional_1/conv2d_4/Conv2D;functional_1/conv2d/Conv2D1:0:0 */, %4) /* ty=Tensor[(1, 25, 5, 64), int32] */;
-#   %6 = clip(%5, a_min=-128f, a_max=127f) /* ty=Tensor[(1, 25, 5, 64), int32] */;
-#   %7 = cast(%6, dtype="int8") /* ty=Tensor[(1, 25, 5, 64), int8] */;
 
 
 def conv2d_pattern(with_pad):
     pattern_input = wildcard()
-    weights = wildcard()
-    bias = wildcard()
+    weights = is_constant()
+    bias = is_constant()
     if with_pad:
         pattern = is_op("nn.pad")(pattern_input, is_constant())
         pattern = is_op("nn.conv2d")(pattern, weights)
@@ -73,7 +69,41 @@ def conv2d_pattern(with_pad):
 
     pattern = is_op("add")(pattern, is_constant())
     pattern = is_op("clip")(pattern)
+    # Optional cast for certain fuse patterns
+    pattern = pattern | is_op("cast")(pattern)
+    return pattern
+
+
+def dense1d_pattern():
+    data = wildcard()
+    weight = is_constant()
+    bias = is_constant()
+    pattern = is_op("nn.dense")(data, weight)
+    pattern = is_op("subtract")(pattern, is_constant())
+    pattern = is_op("nn.bias_add")(pattern, bias)
+    pattern = is_op("fixed_point_multiply")(pattern, is_constant(), is_constant())
+    pattern = is_op("add")(pattern, is_constant())
+    pattern = is_op("clip")(pattern)
+
+
+def qnn_conv2d_pattern():
+    data = wildcard()
+    weight = is_constant()
+    bias = is_constant()
+    pattern = is_op("qnn.conv2d")(
+        data, weight, is_constant(), is_constant(), is_constant(), is_constant()
+    )
+    pattern = is_op("nn.bias_add")(pattern, bias)
+    pattern = is_op("qnn.requantize")
+    pattern = is_op("clip")
+    return pattern
+
+
+def qnn_avg_pool2d_pattern():
+    data = wildcard()
+    pattern = is_op("nn.avg_pool2d")(data)
     pattern = is_op("cast")(pattern)
+    pattern = is_op("reshape")(pattern)
     return pattern
 
 
@@ -149,62 +179,172 @@ def pattern_table():
         conv2d_pattern(True),
         check_is_depthwise,
     )
+    avg_pool2d_pat = ("beaivi.avg_pool2d", qnn_avg_pool2d_pattern())
+    dense1d_pat = ("beaivi.dense1d", dense1d_pattern())
+
+    # qnn_conv2d = ("beaivi.conv2d", qnn_conv2d_pattern())
     # NOTE: Order is import here, since patterns are checked for in order 0->N.
     # Padded are less inclusive so those need to be checked first
-    return [conv2d_padded, conv2d, conv2d_depthwise_padded, conv2d_depthwise]
+    return [
+        conv2d_padded,
+        conv2d,
+        conv2d_depthwise_padded,
+        conv2d_depthwise,
+        avg_pool2d_pat,
+        # dense1d_pat,
+    ]
+    # return [qnn_conv2d]
 
 
 class LegalizeQnnOpForBeaivi(DFPatternCallback):
     def __init__(self):
         super(LegalizeQnnOpForBeaivi, self).__init__()
-
-        # Define common wildcards
-        self.pattern_input = wildcard()
-        self.wgh = wildcard()
+        # Define the pattern to match
+        self.src = wildcard()
+        self.weights = wildcard()
         self.bias = wildcard()
-
-        # Define pad operation (if it exists)
-        self.pad = is_op("nn.pad")(self.pattern_input)
-
-        # Define conv2d operation, which can take either the original src or a padded src
-        self.conv = is_op("nn.conv2d")((self.pad | self.pattern_input), self.wgh)
-
-        # Rest of the pattern
-        self.sub = is_op("subtract")(self.conv, is_constant())
-        self.bias_add = is_op("nn.bias_add")(self.sub, self.bias)
-        self.fixed_point = is_op("fixed_point_multiply_per_axis")(
-            self.bias_add, is_constant(), is_constant(), is_constant()
+        self.root = is_op("qnn.conv2d")(
+            self.src, self.weights, is_constant(), is_constant(), is_constant(), is_constant()
         )
-        self.add = is_op("add")(self.fixed_point, is_constant())
-        self.clip = is_op("clip")(self.add)
-        self.cast = is_op("cast")(self.clip)
+        self.bias_add = is_op("nn.bias_add")(self.root, self.bias)
+        self.requantize = is_op("qnn.requantize")(
+            self.bias_add, wildcard(), wildcard(), wildcard(), wildcard()
+        )
+        self.clip = is_op("clip")(self.requantize) | self.requantize  # Optional clip
 
-        # Full pattern
-        self.pattern = self.cast
+        # The final pattern to match
+        self.pattern = self.clip
 
     def callback(self, pre, post, node_map):
+        """Rewrite qnn.conv2d + bias_add + requantize into a fixed-point implementation."""
         root = node_map[self.root][0]
-        output = relay.Call(conv2d_node.op, conv2d_node.args, attrs=new_attrs)
+        bias = node_map.get(self.bias, default=[relay.const(0, dtype="int32")])[0]
+        src = node_map[self.src][0]
+        weights = node_map[self.weights][0]
+
+        requantize = node_map[self.requantize][0]
+
+        # Extract requantization parameters
+        (
+            rq_input_scale,
+            rq_input_zero_point,
+            rq_output_scale,
+            rq_output_zero_point,
+        ) = requantize.args[1:5]
+        input_zero_point, kernel_zero_point, input_scale, kernel_scale = root.args[2:6]
+
+        input_scale = input_scale.data.numpy()
+        kernel_scale = kernel_scale.data.numpy()
+        rq_input_scale = rq_input_scale.data.numpy()
+        rq_input_zero_point = rq_input_zero_point.data.numpy()
+        rq_output_scale = rq_output_scale.data.numpy()
+        rq_output_zero_point = rq_output_zero_point.data.numpy()
+
+        print("Input scale:", input_scale)
+        print("Input zp:", input_zero_point.data.numpy())
+        print("Kernel scale:", kernel_scale)
+        print("Kernel zp:", kernel_zero_point.data.numpy())
+        print("Rq Input scale:", rq_input_scale)
+        print("Rq Input zp:", rq_input_zero_point)
+        print("Rq Output scale:", rq_output_scale)
+        print("Rq Output zp:", rq_output_zero_point)
+
+        scales, shifts = convert_to_fixed_point(rq_input_scale, rq_output_scale)
+
+        output = tvm.relay.Call(
+            root.op,
+            [
+                src,
+                weights,
+                input_zero_point,
+                kernel_zero_point,
+                relay.const(1.0, dtype="float32"),  # Scales are handeld manually
+                relay.const(1.0, dtype="float32"),
+            ],
+            root.attrs,
+            root.type_args,
+            root.span,
+        )
+
+        output = output + bias
+        output = output * scales
+        output = tvm.relay.fixed_point_multiply(output, scales, shifts)
+
+        output = relay.cast(output, "int8")
 
         return output
+
+
+def convert_to_fixed_point(input_scale, output_scale):
+    input_scale = np.array(input_scale, dtype=np.float64)
+    output_scale = np.array(output_scale, dtype=np.float64)
+    scale_ratio = np.array(output_scale / input_scale, dtype=np.float64)
+    shifts = []
+    scales = []
+    for x in scale_ratio:
+        scales.append(get_fixed_point_multiplier_shift(x)[0])
+        shifts.append(get_fixed_point_multiplier_shift(x)[1])
+    print("Fixed_point_scale:", scales)
+    print("Fixed_point_shift:", shifts)
+    return scales, shifts
+
+
+# NOTE: This works, don't change!
+# def get_fixed_point_multiplier_shift(double_multiplier):
+#     if double_multiplier == 0.0:
+#         return 0, 0
+
+#     significand, exponent = np.frexp(double_multiplier)
+#     significand = np.int32(np.round(significand * (1 << 31)))
+
+#     return significand, exponent - 1  # Adjust exponent to reflect the shift
+
+
+def get_fixed_point_multiplier_shift(double_multiplier):
+    if double_multiplier == 0.0:
+        return 0, 0
+
+    # Get the significand and exponent using frexp
+    significand_d, exponent = np.frexp(double_multiplier)
+
+    # Convert the significand to an integer representation
+    # Multiply by 2^31 and round to the nearest integer
+    significand_int64 = np.floor(significand_d * (1 << 31))
+
+    # Ensure the significand fits within 31 bits
+    if significand_int64 == (1 << 31):
+        significand_int64 //= 2
+        exponent += 1
+
+    # Ensure the significand fits within the range of a 32-bit integer
+    if significand_int64 > np.iinfo(np.int32).max:
+        raise ValueError("Significand exceeds the range of a 32-bit integer.")
+
+    significand = np.int32(significand_int64)
+
+    # Calculate the shift
+    shift = exponent
+
+    return significand, shift
 
 
 def legalize_qnn_for_beaivi(mod):
     print("Legalizing qnn for Beaivi")
 
-    desired_layouts = {"qnn.conv2d": ["NHWC", "OHWI"]}
+    # desired_layouts = {"nn.conv2d": ["NHWC", "HWOI"]}
+    desired_layouts = {"qnn.conv2d": ["NHWC", "HWIO"]}
 
     beaivi_patterns = get_pattern_table("beaivi")
 
     # Pre process
     preprocessor_pass = tvm.transform.Sequential(
         [
-            relay.qnn.transform.Legalize(),
-            relay.qnn.transform.CanonicalizeOps(),
-            relay.transform.InferType(),
             # relay.transform.ConvertLayout(desired_layouts),
+            relay.qnn.transform.CanonicalizeOps(),
+            relay.qnn.transform.Legalize(),
+            relay.transform.InferType(),
             relay.transform.SimplifyExpr(),
-            transform.FoldConstant(),
+            transform.FoldScaleAxis(),
         ]
     )
 
@@ -219,8 +359,9 @@ def legalize_qnn_for_beaivi(mod):
     )
 
     with tvm.transform.PassContext(opt_level=3):
+        # mod = convert_layout_module(mod)
         mod = preprocessor_pass(mod)
-        print(mod)
         # mod["main"] = rewrite(LegalizeQnnOpForBeaivi(), mod["main"])
         mod = annotation_pass(mod)
+        print(mod)
     return mod
