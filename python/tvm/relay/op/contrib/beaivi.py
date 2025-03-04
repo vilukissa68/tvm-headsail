@@ -81,9 +81,10 @@ def dense1d_pattern():
     pattern = is_op("nn.dense")(data, weight)
     pattern = is_op("subtract")(pattern, is_constant())
     pattern = is_op("nn.bias_add")(pattern, bias)
-    pattern = is_op("fixed_point_multiply")(pattern, is_constant(), is_constant())
-    pattern = is_op("add")(pattern, is_constant())
+    pattern = is_op("fixed_point_multiply")(pattern)
+    pattern = is_op("add")(is_constant(), pattern)
     pattern = is_op("clip")(pattern)
+    return pattern
 
 
 def qnn_conv2d_pattern():
@@ -191,7 +192,7 @@ def pattern_table():
         conv2d_depthwise_padded,
         conv2d_depthwise,
         avg_pool2d_pat,
-        # dense1d_pat,
+        dense1d_pat,
     ]
     # return [qnn_conv2d]
 

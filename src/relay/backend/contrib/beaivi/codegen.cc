@@ -50,6 +50,7 @@ using namespace backend;
 
 // Struct to hold all arguments that are to be passed to the function call to the layer
 struct Callables {
+  std::string layer;
   std::vector<std::string> input;  // Comes from previous node
   std::vector<std::string> conv2d_attrs;
   std::vector<std::string> bias;
@@ -60,6 +61,8 @@ struct Callables {
   std::vector<std::string> zp;
   std::vector<std::string> input_sub_attr;
   std::vector<std::string> padding;
+  std::vector<std::string> pool_attrs;
+  std::vector<std::string> dense_attrs;
 };
 
 inline size_t GetShape1DSize(const Type& type) {
@@ -83,6 +86,7 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     const PadAttrs* padding_attrs = nullptr;
     const CallNode* conv2d_node = nullptr;
 
+    callables.layer = "conv2d";
     // Increment total calls in module
     ++funcs_in_mod_;
 
@@ -210,12 +214,125 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     return callables;
   }
 
+  Callables Dense_1d(const FunctionNode* callee, const CallNode* caller, bool depthwise) {
+    Callables callables;
+    const DenseAttrs* dense_attrs = nullptr;
+    std::cout << "Here" << std::endl;
+    ++funcs_in_mod_;
+    callables.layer = "dense1d";
+
+    int zp = 0;
+
+    // Extract function inputs from previous node
+    callables.input.push_back(VisitExpr(caller->args[0])[0].name);  // Get inputs
+    const auto* current_call = callee->body.as<CallNode>();
+
+    if (backend::IsOp(current_call, "clip")) {
+      current_call = current_call->args[0].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "add")) {
+      const int* zp_ptr =
+          static_cast<const int*>((current_call->args[0].as<ConstantNode>()->data)->data);
+      zp = zp_ptr[0];
+      current_call = current_call->args[1].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "fixed_point_multiply")) {
+      const FixedPointMultiplyAttrs* fp_attrs = current_call->attrs.as<FixedPointMultiplyAttrs>();
+      int scale = fp_attrs->multiplier;
+      int shift = fp_attrs->shift;
+      callables.scales.push_back(std::to_string(scale));
+      callables.shifts.push_back(std::to_string(shift));
+
+      current_call = current_call->args[0].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "nn.bias_add")) {
+      callables.bias.push_back(ExtractConstant(current_call->args[1].as<ConstantNode>(), "bias"));
+      current_call = current_call->args[0].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "subtract")) {
+      current_call = current_call->args[0].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "nn.dense")) {
+      // Input features
+      dense_attrs = current_call->attrs.as<DenseAttrs>();
+
+      callables.weights.push_back(
+          ExtractConstant(current_call->args[1].as<ConstantNode>(), "weight"));
+
+      auto ishape = GetShape(current_call->args[0]->checked_type());  // Input shape
+      int input_channels = ishape[1];
+
+      int out_features = dense_attrs->units.as<IntImmNode>()->value;
+      std::cout << "out features: " << out_features << std::endl;
+
+      callables.dense_attrs.push_back(std::to_string(input_channels));
+      callables.dense_attrs.push_back(std::to_string(out_features));
+      callables.input_sub_attr.push_back(std::to_string(zp));
+    }
+
+    return callables;
+  }
+
   Callables Avg_pool2d(const FunctionNode* callee, const CallNode* caller, bool depthwise) {
     Callables callables;
-    const Conv2DAttrs* conv2d_attr = nullptr;
-    const PadAttrs* padding_attrs = nullptr;
-    const CallNode* conv2d_node = nullptr;
-    std::cout << "Here" << std::endl;
+    const AvgPool2DAttrs* pool_attrs = nullptr;
+
+    ++funcs_in_mod_;
+    callables.layer = "avgpool2d";
+
+    // Extract function inputs from previous node
+    callables.input.push_back(VisitExpr(caller->args[0])[0].name);  // Get inputs
+
+    const auto* current_call = callee->body.as<CallNode>();
+
+    if (backend::IsOp(current_call, "reshape")) {
+      current_call = current_call->args[0].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "cast")) {
+      current_call = current_call->args[0].as<CallNode>();
+    }
+    if (backend::IsOp(current_call, "nn.avg_pool2d")) {
+      // current_call = current_call->args[0].as<CallNode>();
+
+      pool_attrs = current_call->attrs.as<AvgPool2DAttrs>();
+      int stride_y = pool_attrs->strides[0].as<IntImmNode>()->value;
+      int stride_x = pool_attrs->strides[1].as<IntImmNode>()->value;
+      std::cout << "Stride Y: " << std::to_string(stride_y) << std::endl;
+      std::cout << "Stride X: " << std::to_string(stride_x) << std::endl;
+      int pool_size_y = pool_attrs->pool_size[0].as<IntImmNode>()->value;
+      int pool_size_x = pool_attrs->pool_size[1].as<IntImmNode>()->value;
+      std::cout << "Pool size Y: " << std::to_string(pool_size_y) << std::endl;
+      std::cout << "Pool size X: " << std::to_string(pool_size_x) << std::endl;
+
+      int pad_top = pool_attrs->padding[0].as<IntImmNode>()->value;
+      int pad_right = pool_attrs->padding[3].as<IntImmNode>()->value;
+      int pad_left = pool_attrs->padding[1].as<IntImmNode>()->value;
+      int pad_bottom = pool_attrs->padding[2].as<IntImmNode>()->value;
+
+      // Pattern input properties
+      auto ishape = GetShape(current_call->args[0]->checked_type());  // Input shape
+      int input_channels = ishape[3];
+      int input_height = ishape[1] - pad_bottom - pad_top;
+      int input_width = ishape[2] - pad_right - pad_left;
+
+      callables.conv2d_attrs.push_back(std::to_string(input_height));
+      callables.conv2d_attrs.push_back(std::to_string(input_width));
+      callables.conv2d_attrs.push_back(std::to_string(input_channels));
+
+      callables.pool_attrs.push_back(std::to_string(pool_size_y));
+      callables.pool_attrs.push_back(std::to_string(pool_size_x));
+      // callables.pool_attrs.push_back(std::to_string(stride_y));
+      // callables.pool_attrs.push_back(std::to_string(stride_x));
+      // NOTE: For now let's keep stride as 1
+      callables.pool_attrs.push_back(std::to_string(1));
+      callables.pool_attrs.push_back(std::to_string(1));
+
+      // callables.pool_attrs.push_back(std::to_string(pad_top));
+      // callables.pool_attrs.push_back(std::to_string(pad_right));
+      // callables.pool_attrs.push_back(std::to_string(pad_left));
+      // callables.pool_attrs.push_back(std::to_string(pad_bottom));
+    }
+
     return callables;
   }
 
@@ -397,9 +514,11 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
       Callables arguments = Conv2d_bias(callee, caller, true);
       return GenerateBody(caller, "beaivi_conv2d_depthwise_int8_nhwc", arguments);
     } else if (pattern_name == "beaivi.avg_pool2d") {
-      std::cout << "HEREEE" << std::endl;
-      Callables arguments = Conv2d_bias(callee, caller, true);
+      Callables arguments = Avg_pool2d(callee, caller, false);
       return GenerateBody(caller, "beaivi_avgpool2d_int8_nhwc", arguments);
+    } else if (pattern_name == "beaivi.dense1d") {
+      Callables arguments = Dense_1d(callee, caller, false);
+      return GenerateBody(caller, "beaivi_dense1d_int8", arguments);
     }
 
     LOG(FATAL) << "Unknown composite function:" << pattern_name;
@@ -412,8 +531,10 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     std::ostringstream decl_stream;
 
     // Wildcard arguments i.e. input, weight, output
-    decl_stream << "(" << args.input[0];
-    std::cout << "Input arguments handled" << std::endl;
+    if (args.input.size() > 0) {
+      decl_stream << "(" << args.input[0];
+      std::cout << "Input arguments handled" << std::endl;
+    }
 
     // Analyze the output buffers
     std::vector<Type> out_types;
@@ -446,7 +567,12 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
         out = "io_buf";
       }
       const auto out_size = GetShape1DSize(out_type) * sizeof(int32_t);
-      decl_stream << ", " << out << ", " << "padding_buf";
+
+      decl_stream << ", " << out;
+
+      if (args.layer == "conv2d" || args.layer == "dense1d") {
+        decl_stream << ", " << "padding_buf";
+      }
 
       Output output;
       output.name = out;
@@ -457,23 +583,46 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
       ret.outputs.push_back(output);
     }
 
-    decl_stream << ", " << args.weights[0];
-    decl_stream << ", " << args.bias[0];
+    if (args.weights.size() > 0) {
+      decl_stream << ", " << args.weights[0];
+    }
+
+    if (args.bias.size() > 0) {
+      decl_stream << ", " << args.bias[0];
+    }
 
     // Input subtraction
-    std::cout << "Input sub: " << args.input_sub_attr[0] << std::endl;
-    decl_stream << ", " << args.input_sub_attr[0];
+    //
+    if (args.input_sub_attr.size() > 0) {
+      std::cout << "Input sub: " << args.input_sub_attr[0] << std::endl;
+      decl_stream << ", " << args.input_sub_attr[0];
+    }
 
     // Conv2d Attrs
     for (size_t i = 0; i < args.conv2d_attrs.size(); ++i) {
       decl_stream << ", " << args.conv2d_attrs[i];
     }
 
+    // Avg pool attrs
+    for (size_t i = 0; i < args.pool_attrs.size(); ++i) {
+      decl_stream << ", " << args.pool_attrs[i];
+    }
+
+    // Dense 1d attrs
+    for (size_t i = 0; i < args.dense_attrs.size(); ++i) {
+      decl_stream << ", " << args.dense_attrs[i];
+    }
+
     // // Requantize attrs
-    decl_stream << ", " << args.scales[0];       // Scaling factor
-    decl_stream << ", " << args.shifts[0];       // Shift
-    decl_stream << ", " << args.zp_subtract[0];  // Input Zero point
-    // decl_stream << ", " << args.zp[0];           // Input Zero point
+    if (args.scales.size() > 0) {
+      decl_stream << ", " << args.scales[0];  // Scaling factor
+    }
+    if (args.shifts.size() > 0) {
+      decl_stream << ", " << args.shifts[0];  // Shift
+    }
+    if (args.zp_subtract.size() > 0) {
+      decl_stream << ", " << args.zp_subtract[0];  // Input Zero point
+    }
     decl_stream << ");";
     ret.decl = func_name + decl_stream.str();
     return ret;
@@ -550,6 +699,7 @@ class BeaiviModuleCodegen : public CSourceModuleCodegenBase {
     code_stream_ << "#include <dsp_conv2d.h>\n";
     code_stream_ << "#include <dsp_conv2d_depthwise.h>\n";
     code_stream_ << "#include <dsp_avgpool2d.h>\n";
+    code_stream_ << "#include <dsp_dense1d.h>\n";
     code_stream_ << "\n";
 
     ICHECK(ref->IsInstance<FunctionNode>());
