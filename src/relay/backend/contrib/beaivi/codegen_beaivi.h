@@ -234,7 +234,7 @@ class BeaiviCodegenCBase {
     } else if (runtime::TypeMatch(ttype->dtype, kDLBfloat, 16)) {
       dtype = "bfloat";
     } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 32)) {
-      dtype = "int";
+      dtype = "int32_t";
     } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 64)) {
       dtype = "int64_t";
     } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 8)) {

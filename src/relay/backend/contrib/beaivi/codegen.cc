@@ -239,7 +239,13 @@ class CodegenBeaivi : public MemoizedExprTranslator<std::vector<Output>>,
     if (backend::IsOp(current_call, "fixed_point_multiply")) {
       const FixedPointMultiplyAttrs* fp_attrs = current_call->attrs.as<FixedPointMultiplyAttrs>();
       int scale = fp_attrs->multiplier;
-      int shift = fp_attrs->shift;
+      int shift = fp_attrs->shift;  // NOTE: This scale needs to be reversed into positive range
+                                    // since DSP doesn't support reversed shift
+
+      if (shift < 0) {
+        shift = shift * -1;
+      }
+
       callables.scales.push_back(std::to_string(scale));
       callables.shifts.push_back(std::to_string(shift));
 
